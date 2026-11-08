@@ -2,7 +2,9 @@
 
 This repository is the public distribution of the Go SDK maintained in the Squasher monorepo.
 
-Install with:
+This package is for Go applications that use `log/slog`. It requires Go 1.21 or later. Run this
+command in your Go module (the folder with `go.mod`). For other languages, see the
+[quickstart](https://docs.squasher.ai/quickstart).
 
 ```bash
 go get github.com/squasher-ai/squasher-go
