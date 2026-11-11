@@ -118,11 +118,11 @@ func TestHandlePostsExpectedPayload(t *testing.T) {
 	}
 
 	sdk := request.body["sdk"].(map[string]any)
-	if sdk["name"] != "squasher-go" || sdk["version"] != "0.1.0" {
+	if sdk["name"] != "squasher-go" || sdk["version"] != "0.3.0" {
 		t.Fatalf("unexpected sdk payload: %#v", sdk)
 	}
 
-	attrs := request.body["attrs"].(map[string]any)
+	attrs := request.body["attributes"].(map[string]any)
 	httpAttrs := attrs["http"].(map[string]any)
 	if attrs["service"] != "checkout" || attrs["request_id"] != "req-123" || httpAttrs["method"] != "POST" {
 		t.Fatalf("unexpected attrs payload: %#v", attrs)
@@ -131,10 +131,6 @@ func TestHandlePostsExpectedPayload(t *testing.T) {
 		t.Fatalf("unexpected numeric attr: %#v", attrs["attempt"])
 	}
 
-	tags := request.body["tags"].(map[string]any)
-	if tags["http.method"] != "POST" || tags["request_id"] != "req-123" {
-		t.Fatalf("unexpected tag payload: %#v", tags)
-	}
 }
 
 func TestWithGroupScopesOnlyFutureAttributes(t *testing.T) {
@@ -156,7 +152,7 @@ func TestWithGroupScopesOnlyFutureAttributes(t *testing.T) {
 		t.Fatalf("flush handler: %v", err)
 	}
 
-	attrs := server.snapshot()[0].body["attrs"].(map[string]any)
+	attrs := server.snapshot()[0].body["attributes"].(map[string]any)
 	if attrs["service"] != "payments" {
 		t.Fatalf("expected ungrouped service attr, got %#v", attrs)
 	}
@@ -180,6 +176,57 @@ func TestEnabledRespectsConfiguredLevel(t *testing.T) {
 	}
 	if !handler.Enabled(context.Background(), slog.LevelError) {
 		t.Fatal("expected error level to be enabled")
+	}
+}
+
+func TestOutcomeSamplingKeepsErrorsAndDropsRoutineSuccess(t *testing.T) {
+	server := newRecordingServer(0)
+	t.Cleanup(server.close)
+	sampling := DefaultSamplingConfig()
+	sampling.SuccessRate = 0
+	handler := NewHandler(
+		"sq_pk_test",
+		"project-123",
+		WithEndpoint(server.url()),
+		WithSampling(sampling),
+	)
+	t.Cleanup(func() { _ = handler.Close() })
+	logger := slog.New(handler)
+
+	logger.Info("routine success")
+	logger.Error("important failure")
+	if err := handler.Flush(context.Background()); err != nil {
+		t.Fatalf("flush handler: %v", err)
+	}
+
+	requests := server.snapshot()
+	if len(requests) != 1 || requests[0].body["message"] != "important failure" {
+		t.Fatalf("unexpected sampled requests: %#v", requests)
+	}
+}
+
+func TestTraceCorrelationUsesTypedAttributes(t *testing.T) {
+	server := newRecordingServer(0)
+	t.Cleanup(server.close)
+	handler := NewHandler("sq_pk_test", "project-123", WithEndpoint(server.url()))
+	t.Cleanup(func() { _ = handler.Close() })
+	logger := slog.New(handler)
+
+	logger.Info(
+		"cache lookup",
+		slog.String("trace_id", "0123456789abcdef0123456789abcdef"),
+		slog.String("span_id", "0123456789abcdef"),
+		slog.Bool("cache.hit", true),
+	)
+	if err := handler.Flush(context.Background()); err != nil {
+		t.Fatalf("flush handler: %v", err)
+	}
+
+	body := server.snapshot()[0].body
+	trace := body["trace"].(map[string]any)
+	attrs := body["attributes"].(map[string]any)
+	if trace["trace_id"] != "0123456789abcdef0123456789abcdef" || attrs["cache.hit"] != true {
+		t.Fatalf("unexpected correlated payload: %#v", body)
 	}
 }
 

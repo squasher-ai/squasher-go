@@ -1,10 +1,7 @@
 package squasher
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -15,9 +12,10 @@ import (
 const (
 	DefaultEndpoint       = "https://ingest.squasher.ai"
 	SDKName               = "squasher-go"
-	SDKVersion            = "0.1.0"
+	SDKVersion            = "0.3.0"
 	defaultBufferSize     = 100
 	defaultRequestTimeout = 5 * time.Second
+	maxRetries            = 3
 )
 
 type SquasherHandler struct {
@@ -25,6 +23,7 @@ type SquasherHandler struct {
 	level      slog.Leveler
 	baseAttrs  map[string]any
 	groups     []string
+	sampling   SamplingConfig
 }
 
 type dispatcher struct {
@@ -34,10 +33,16 @@ type dispatcher struct {
 	client    *http.Client
 	queue     chan eventPayload
 	done      chan struct{}
-	wg        sync.WaitGroup
+	stop      chan struct{}
+	ctx       context.Context
+	cancel    context.CancelFunc
+	pending   int
+	idle      chan struct{}
 	mu        sync.Mutex
 	closed    bool
+	disabled  bool
 	closeOnce sync.Once
+	stopOnce  sync.Once
 }
 
 func NewHandler(apiKey, projectID string, opts ...Option) *SquasherHandler {
@@ -57,6 +62,7 @@ func NewHandler(apiKey, projectID string, opts ...Option) *SquasherHandler {
 		dispatcher: sharedDispatcher,
 		level:      cfg.level,
 		baseAttrs:  map[string]any{},
+		sampling:   cfg.sampling,
 	}
 }
 
@@ -71,7 +77,10 @@ func (h *SquasherHandler) Handle(_ context.Context, record slog.Record) error {
 	if h.dispatcher == nil {
 		return nil
 	}
-	h.dispatcher.enqueue(buildPayload(record, h.baseAttrs, h.groups))
+	payload := buildPayload(record, h.baseAttrs, h.groups)
+	if shouldSample(payload, h.sampling) {
+		h.dispatcher.enqueue(payload)
+	}
 	return nil
 }
 
@@ -81,6 +90,7 @@ func (h *SquasherHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 		level:      h.level,
 		baseAttrs:  cloneAttrs(h.baseAttrs),
 		groups:     append([]string(nil), h.groups...),
+		sampling:   h.sampling,
 	}
 	for _, attr := range attrs {
 		applyAttr(next.baseAttrs, next.groups, attr)
@@ -97,6 +107,7 @@ func (h *SquasherHandler) WithGroup(name string) slog.Handler {
 		level:      h.level,
 		baseAttrs:  h.baseAttrs,
 		groups:     append(append([]string(nil), h.groups...), name),
+		sampling:   h.sampling,
 	}
 }
 
@@ -108,10 +119,16 @@ func (h *SquasherHandler) Flush(ctx context.Context) error {
 }
 
 func (h *SquasherHandler) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return h.Shutdown(ctx)
+}
+
+func (h *SquasherHandler) Shutdown(ctx context.Context) error {
 	if h.dispatcher == nil {
 		return nil
 	}
-	return h.dispatcher.close()
+	return h.dispatcher.shutdown(ctx)
 }
 
 func newDispatcher(apiKey, projectID string, cfg transportConfig) *dispatcher {
@@ -122,7 +139,11 @@ func newDispatcher(apiKey, projectID string, cfg transportConfig) *dispatcher {
 		client:    cfg.client,
 		queue:     make(chan eventPayload, cfg.bufferSize),
 		done:      make(chan struct{}),
+		stop:      make(chan struct{}),
+		idle:      make(chan struct{}),
 	}
+	close(dispatcher.idle)
+	dispatcher.ctx, dispatcher.cancel = context.WithCancel(context.Background())
 	go dispatcher.run()
 	return dispatcher
 }
@@ -130,73 +151,67 @@ func newDispatcher(apiKey, projectID string, cfg transportConfig) *dispatcher {
 func (d *dispatcher) enqueue(payload eventPayload) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.closed {
+	if d.closed || d.disabled {
 		return
 	}
 
-	d.wg.Add(1)
+	if d.pending == 0 {
+		d.idle = make(chan struct{})
+	}
+	d.pending++
 	select {
 	case d.queue <- payload:
 	default:
-		d.wg.Done()
+		d.pending--
+		if d.pending == 0 {
+			close(d.idle)
+		}
 	}
 }
 
 func (d *dispatcher) flush(ctx context.Context) error {
-	wait := make(chan struct{})
-	go func() {
-		d.wg.Wait()
-		close(wait)
-	}()
-
+	d.mu.Lock()
+	idle := d.idle
+	d.mu.Unlock()
 	select {
-	case <-wait:
+	case <-idle:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
-func (d *dispatcher) close() error {
+func (d *dispatcher) shutdown(ctx context.Context) error {
 	d.closeOnce.Do(func() {
 		d.mu.Lock()
 		d.closed = true
 		close(d.queue)
 		d.mu.Unlock()
-		<-d.done
 	})
-	return nil
+	select {
+	case <-d.done:
+		return nil
+	case <-ctx.Done():
+		d.stopOnce.Do(func() { close(d.stop); d.cancel() })
+		return ctx.Err()
+	}
 }
 
 func (d *dispatcher) run() {
 	defer close(d.done)
+	defer d.cancel()
 	for payload := range d.queue {
-		d.send(payload)
-		d.wg.Done()
+		d.mu.Lock()
+		disabled := d.disabled
+		d.mu.Unlock()
+		if !disabled {
+			d.send(d.ctx, payload)
+		}
+		d.mu.Lock()
+		d.pending--
+		if d.pending == 0 {
+			close(d.idle)
+		}
+		d.mu.Unlock()
 	}
-}
-
-func (d *dispatcher) send(payload eventPayload) {
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return
-	}
-
-	request, err := http.NewRequest(
-		http.MethodPost,
-		d.endpoint+"/v1/ingest/"+d.projectID,
-		bytes.NewReader(body),
-	)
-	if err != nil {
-		return
-	}
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("x-squasher-key", d.apiKey)
-
-	response, err := d.client.Do(request)
-	if err != nil {
-		return
-	}
-	defer response.Body.Close()
-	_, _ = io.Copy(io.Discard, response.Body)
 }

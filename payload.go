@@ -3,18 +3,27 @@ package squasher
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
+	"slices"
+	"strconv"
 	"time"
 )
 
 type eventPayload struct {
-	Message   string            `json:"message"`
-	Level     string            `json:"level"`
-	Timestamp string            `json:"timestamp"`
-	Attrs     map[string]any    `json:"attrs"`
-	Tags      map[string]string `json:"tags,omitempty"`
-	Extra     map[string]any    `json:"extra,omitempty"`
-	SDK       sdkInfo           `json:"sdk"`
+	Message    string         `json:"message"`
+	Level      string         `json:"level"`
+	Timestamp  string         `json:"timestamp"`
+	Attributes map[string]any `json:"attributes,omitempty"`
+	EventName  string         `json:"event_name,omitempty"`
+	Release    string         `json:"release,omitempty"`
+	Trace      *traceContext  `json:"trace,omitempty"`
+	SDK        sdkInfo        `json:"sdk"`
+}
+
+type traceContext struct {
+	TraceID string `json:"trace_id,omitempty"`
+	SpanID  string `json:"span_id,omitempty"`
 }
 
 type sdkInfo struct {
@@ -35,20 +44,94 @@ func buildPayload(record slog.Record, baseAttrs map[string]any, groups []string)
 	}
 
 	payload := eventPayload{
-		Message:   record.Message,
-		Level:     mapLevel(record.Level),
-		Timestamp: timestamp.Format(time.RFC3339Nano),
-		Attrs:     attrs,
+		Message:    record.Message,
+		Level:      mapLevel(record.Level),
+		Timestamp:  timestamp.Format(time.RFC3339Nano),
+		Attributes: attrs,
+		EventName:  stringAttribute(attrs, "event.name", "event_name"),
+		Release:    stringAttribute(attrs, "service.version", "release"),
+		Trace:      traceFromAttributes(attrs),
 		SDK: sdkInfo{
 			Name:    SDKName,
 			Version: SDKVersion,
 		},
 	}
-	if len(attrs) > 0 {
-		payload.Tags = flattenAttrs(attrs)
-		payload.Extra = attrs
-	}
 	return payload
+}
+
+func traceFromAttributes(attrs map[string]any) *traceContext {
+	trace := &traceContext{
+		TraceID: stringAttribute(attrs, "trace.id", "trace_id", "traceId"),
+		SpanID:  stringAttribute(attrs, "span.id", "span_id", "spanId"),
+	}
+	if trace.TraceID == "" && trace.SpanID == "" {
+		return nil
+	}
+	return trace
+}
+
+func shouldSample(payload eventPayload, sampling SamplingConfig) bool {
+	if slices.Contains(sampling.AlwaysSampleReleases, payload.Release) && payload.Release != "" {
+		return true
+	}
+	userID := stringAttribute(payload.Attributes, "user.id", "user_id")
+	if userID != "" && slices.Contains(sampling.AlwaysSampleUserIDs, userID) {
+		return true
+	}
+
+	rate := sampling.SuccessRate
+	if payload.Level == "fatal" || payload.Level == "error" || payload.Level == "warning" {
+		rate = sampling.ErrorRate
+	} else if durationMilliseconds(payload.Attributes) >= sampling.SlowThreshold.Milliseconds() {
+		rate = sampling.SlowRate
+	}
+	if rate >= 1 {
+		return true
+	}
+	if rate <= 0 {
+		return false
+	}
+	key := payload.Message + "|" + payload.Timestamp
+	if payload.Trace != nil && payload.Trace.TraceID != "" {
+		key = "trace:" + payload.Trace.TraceID
+	}
+	hash := fnv.New32a()
+	_, _ = hash.Write([]byte(key))
+	return float64(hash.Sum32())/4_294_967_296 < rate
+}
+
+func durationMilliseconds(attrs map[string]any) int64 {
+	value := attribute(attrs, "duration_ms", "squasher.duration_ms")
+	switch typed := value.(type) {
+	case int64:
+		return typed
+	case int:
+		return int64(typed)
+	case float64:
+		return int64(typed)
+	case string:
+		parsed, _ := strconv.ParseInt(typed, 10, 64)
+		return parsed
+	default:
+		return -1
+	}
+}
+
+func stringAttribute(attrs map[string]any, keys ...string) string {
+	value := attribute(attrs, keys...)
+	if value == nil {
+		return ""
+	}
+	return fmt.Sprint(value)
+}
+
+func attribute(attrs map[string]any, keys ...string) any {
+	for _, key := range keys {
+		if value, ok := attrs[key]; ok {
+			return value
+		}
+	}
+	return nil
 }
 
 func applyAttr(target map[string]any, groups []string, attr slog.Attr) {

@@ -2,8 +2,10 @@ package squasher
 
 import (
 	"log/slog"
+	"math"
 	"net/http"
 	"strings"
+	"time"
 )
 
 type Option func(*transportConfig)
@@ -13,6 +15,25 @@ type transportConfig struct {
 	client     *http.Client
 	bufferSize int
 	level      slog.Leveler
+	sampling   SamplingConfig
+}
+
+type SamplingConfig struct {
+	SuccessRate          float64
+	ErrorRate            float64
+	SlowRate             float64
+	SlowThreshold        time.Duration
+	AlwaysSampleUserIDs  []string
+	AlwaysSampleReleases []string
+}
+
+func DefaultSamplingConfig() SamplingConfig {
+	return SamplingConfig{
+		SuccessRate:   1,
+		ErrorRate:     1,
+		SlowRate:      1,
+		SlowThreshold: time.Second,
+	}
 }
 
 func defaultTransportConfig() transportConfig {
@@ -21,6 +42,13 @@ func defaultTransportConfig() transportConfig {
 		client:     &http.Client{Timeout: defaultRequestTimeout},
 		bufferSize: defaultBufferSize,
 		level:      slog.LevelDebug,
+		sampling:   DefaultSamplingConfig(),
+	}
+}
+
+func WithSampling(sampling SamplingConfig) Option {
+	return func(cfg *transportConfig) {
+		cfg.sampling = normalizeSampling(sampling)
 	}
 }
 
@@ -55,4 +83,21 @@ func WithLevel(level slog.Leveler) Option {
 			cfg.level = level
 		}
 	}
+}
+
+func normalizeSampling(sampling SamplingConfig) SamplingConfig {
+	sampling.SuccessRate = clampRate(sampling.SuccessRate)
+	sampling.ErrorRate = clampRate(sampling.ErrorRate)
+	sampling.SlowRate = clampRate(sampling.SlowRate)
+	if sampling.SlowThreshold < 0 {
+		sampling.SlowThreshold = 0
+	}
+	return sampling
+}
+
+func clampRate(rate float64) float64 {
+	if math.IsNaN(rate) {
+		return 1
+	}
+	return min(1, max(0, rate))
 }
